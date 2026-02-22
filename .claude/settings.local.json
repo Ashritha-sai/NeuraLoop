@@ -5,7 +5,8 @@
       "Bash(echo EXIT_CODE=$?:*)",
       "Bash(pip install:*)",
       "Bash(ls:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(cd C:\\\\Users\\\\Ashritha\\\\OneDrive\\\\Desktop\\\\Pupil:*)"
     ]
   }
 }

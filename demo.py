@@ -3,6 +3,8 @@ import threading, time, json, os, random
 from pathlib import Path
 import statistics
 from statistics import mean
+from dotenv import load_dotenv
+load_dotenv()
 
 try:
     from groq import Groq
@@ -41,6 +43,20 @@ def _get_hw():
     return HW()
 
 hw = _get_hw()
+
+@st.fragment(run_every=0.5)
+def live_pupil_metrics():
+    with hw.lock:
+        recent = [x[3] for x in hw.pupil if x[0] > time.time() - 0.5]
+    raw = mean(recent) if recent else 0.0
+    delta = raw - hw.baseline_mm if recent else 0.0
+    bw_live = [b for b in hw.blinks if b[0] >= st.session_state.t_start]
+    with hw.lock:
+        scount = len([x for x in hw.pupil if x[0] >= st.session_state.t_start])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Live Pupil (mm)", f"{raw:.2f}", delta=f"{delta:+.3f} mm")
+    c2.metric("Blinks", len(bw_live))
+    c3.metric("Samples", scount)
 
 def _read(inlet):
     while True:
@@ -300,17 +316,7 @@ elif st.session_state.phase == "annotate":
         f"font-size:1.5rem;text-align:center;margin:20px 0'>{sentence}</div>",
         unsafe_allow_html=True,
     )
-    with hw.lock:
-        recent = [x[3] for x in hw.pupil if x[0] > time.time() - 0.5]
-    delta = mean(recent) - hw.baseline_mm if recent else 0.0
-    color = "green" if abs(delta) < 0.3 else "orange" if abs(delta) < 0.6 else "red"
-    bw_live = [b for b in hw.blinks if b[0] >= st.session_state.t_start]
-    with hw.lock:
-        scount = len([x for x in hw.pupil if x[0] >= st.session_state.t_start])
-    c1, c2, c3 = st.columns(3)
-    c1.markdown(f"**Pupil Δ:** :{color}[{delta:+.3f} mm]")
-    c2.metric("Blinks", len(bw_live))
-    c3.metric("Samples", scount)
+    live_pupil_metrics()
 
     col1, col2 = st.columns(2)
     yes_clicked = col1.button("YES", type="primary", use_container_width=True)
@@ -372,8 +378,7 @@ elif st.session_state.phase == "annotate":
             st.session_state.phase = "results"
             st.rerun()
     else:
-        time.sleep(0.3)
-        st.rerun()
+        pass  # fragment auto-refreshes live metrics
 
 # ── PHASE: results ───────────────────────────────────────────────────
 elif st.session_state.phase == "results":
@@ -454,7 +459,7 @@ elif st.session_state.phase == "results":
         st.session_state.results = []
         st.session_state.t_start = 0.0
         st.session_state.t_baseline = 0.0
-        st.session_state.sentences = []
-        st.session_state._sentence_result = []
-        st.session_state._sentence_thread = None
+        st.session_state["sentences"] = []
+        st.session_state["_sentence_result"] = []
+        st.session_state["_sentence_thread"] = None
         st.rerun()
