@@ -1,8 +1,14 @@
 import streamlit as st
-import threading, time, json, os
+import threading, time, json, os, random
 from pathlib import Path
 import statistics
 from statistics import mean
+
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
 
 try:
     from pylsl import resolve_byprop, StreamInlet
@@ -28,7 +34,7 @@ class HW:
         self._bstate = "OPEN"
         self._bopen  = None
         self.lock = threading.Lock()
-        self._thread_started = False
+        self._thread = None
 
 @st.cache_resource
 def _get_hw():
@@ -38,29 +44,32 @@ hw = _get_hw()
 
 def _read(inlet):
     while True:
-        s, _ = inlet.pull_sample(timeout=0.05)
-        if not s:
-            continue
-        t = time.time()
-        pl, pr = s[2], s[9]
-        el, er = s[18], s[21]
-        em = (el + er) / 2
-        with hw.lock:
-            hw.pupil.append((t, pl, pr, (pl + pr) / 2))
-            hw.gaze.append((t, s[0], s[1]))
-            hw.eyelid.append((t, el, er))
-            if hw._bstate == "OPEN" and em < 2.0:
-                hw._bstate = "CLOSING"
-                hw._bopen = t
-            elif hw._bstate == "CLOSING" and em > 5.0:
-                dur = (t - hw._bopen) * 1000
-                if dur > 50:
-                    hw.blinks.append((t, dur))
-                hw._bstate = "OPEN"
-            cutoff = t - 60
-            hw.pupil  = [x for x in hw.pupil  if x[0] > cutoff]
-            hw.gaze   = [x for x in hw.gaze   if x[0] > cutoff]
-            hw.eyelid = [x for x in hw.eyelid if x[0] > cutoff]
+        try:
+            s, _ = inlet.pull_sample(timeout=0.05)
+            if not s:
+                continue
+            t = time.time()
+            pl, pr = s[2], s[9]
+            el, er = s[18], s[21]
+            em = (el + er) / 2
+            with hw.lock:
+                hw.pupil.append((t, pl, pr, (pl + pr) / 2))
+                hw.gaze.append((t, s[0], s[1]))
+                hw.eyelid.append((t, el, er))
+                if hw._bstate == "OPEN" and em < 2.0:
+                    hw._bstate = "CLOSING"
+                    hw._bopen = t
+                elif hw._bstate == "CLOSING" and em > 5.0:
+                    dur = (t - hw._bopen) * 1000
+                    if dur > 50:
+                        hw.blinks.append((t, dur))
+                    hw._bstate = "OPEN"
+                cutoff = t - 60
+                hw.pupil  = [x for x in hw.pupil  if x[0] > cutoff]
+                hw.gaze   = [x for x in hw.gaze   if x[0] > cutoff]
+                hw.eyelid = [x for x in hw.eyelid if x[0] > cutoff]
+        except Exception:
+            time.sleep(0.1)
 
 def window(buf, t0, t1):
     with hw.lock:
@@ -167,19 +176,60 @@ def compute_session_score(results):
     }
 
 # ── Sentences ────────────────────────────────────────────────────────
-SENTENCES = [
-    "The patient should take two tablets with water twice daily.",
-    "Aspirin irreversibly inhibits COX-1 and COX-2 enzymes, reducing prostaglandin synthesis and platelet aggregation.",
-    "Click save before closing the application.",
-    "Stochastic gradient descent with momentum converges faster than vanilla gradient descent on non-convex loss surfaces.",
-    "The meeting is confirmed for Thursday at two in the afternoon.",
-    "Pharmacokinetic variability across patients necessitates individualised dosimetric recalibration for optimal outcomes.",
+FALLBACK_SENTENCES = [
+    "Octopuses have three hearts and blue blood.",
+    "The ancient Romans used concrete that grew stronger over centuries from seawater exposure.",
+    "A single bolt of lightning carries enough energy to toast about a hundred thousand slices of bread.",
+    "She finished the marathon despite the rain.",
+    "Honey never spoils because its low moisture and acidic pH create an inhospitable environment for bacteria.",
 ]
+
+def _fetch_sentences(result_list):
+    if not HAS_GROQ:
+        result_list.append(FALLBACK_SENTENCES)
+        return
+    try:
+        topics = ["astronomy", "ocean life", "ancient history", "cooking", "architecture",
+                  "weather patterns", "music theory", "mathematics", "animal behavior",
+                  "world travel", "medicine", "literature", "geology", "photography",
+                  "economics", "botany", "mythology", "robotics", "linguistics", "sports"]
+        chosen = random.sample(topics, 3)
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Return ONLY a JSON array of exactly 5 standalone English sentences. No markdown, no explanation, no code fences — just the raw JSON array. Each sentence must be completely self-contained and meaningful on its own — a reader should fully understand it without any prior context. Vary the length: one short (5-8 words), two medium (10-18 words), one long detailed sentence (20-30 words), and one more short. Each sentence should teach something interesting or paint a vivid picture. Never produce vague filler like 'close the door' or 'it will rain tomorrow'."
+                },
+                {
+                    "role": "user",
+                    "content": f"Generate 5 unique sentences touching on these topics: {', '.join(chosen)}."
+                }
+            ],
+            max_tokens=300,
+            temperature=0.9,
+        )
+        text = response.choices[0].message.content.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        sentences = json.loads(text)
+        if isinstance(sentences, list) and len(sentences) == 5 and all(isinstance(s, str) for s in sentences):
+            result_list.append(sentences)
+        else:
+            result_list.append(FALLBACK_SENTENCES)
+    except Exception:
+        result_list.append(FALLBACK_SENTENCES)
 
 # ── Streamlit UI ─────────────────────────────────────────────────────
 st.set_page_config(page_title="Implicit Annotator", layout="wide")
 
-for k, v in {"phase": "start", "idx": 0, "results": [], "t_start": 0.0, "t_baseline": 0.0}.items():
+for k, v in {"phase": "start", "idx": 0, "results": [], "t_start": 0.0, "t_baseline": 0.0, "sentences": [], "_sentence_result": [], "_sentence_thread": None}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -187,25 +237,31 @@ for k, v in {"phase": "start", "idx": 0, "results": [], "t_start": 0.0, "t_basel
 if st.session_state.phase == "start":
     st.title("Implicit — Neural Annotation")
     if st.button("Connect and Start"):
-        if not hw._thread_started:
-            connected = False
-            if HAS_LSL:
-                try:
-                    streams = resolve_byprop("type", "Gaze", timeout=8)
-                    if streams:
-                        inlet = StreamInlet(streams[0])
-                        threading.Thread(target=_read, args=(inlet,), daemon=True).start()
-                        hw._thread_started = True
-                        connected = True
-                except Exception:
-                    connected = False
-            hw.connected = connected
+        connected = False
+        if HAS_LSL:
+            try:
+                streams = resolve_byprop("type", "Gaze", timeout=8)
+                if streams:
+                    inlet = StreamInlet(streams[0])
+                    t = threading.Thread(target=_read, args=(inlet,), daemon=True)
+                    t.start()
+                    hw._thread = t
+                    connected = True
+            except Exception:
+                connected = False
+        hw.connected = connected
         st.session_state.phase = "baseline"
         st.session_state.t_baseline = time.time()
         st.rerun()
 
 # ── PHASE: baseline ─────────────────────────────────────────────────
 elif st.session_state.phase == "baseline":
+    if st.session_state["_sentence_thread"] is None:
+        result_list = []
+        st.session_state["_sentence_result"] = result_list
+        t = threading.Thread(target=_fetch_sentences, args=(result_list,), daemon=True)
+        st.session_state["_sentence_thread"] = t
+        t.start()
     elapsed = time.time() - st.session_state.t_baseline
     remaining = max(0, 10 - elapsed)
     st.subheader("Relax and look at the screen")
@@ -218,6 +274,15 @@ elif st.session_state.phase == "baseline":
         with hw.lock:
             vals = [x[3] for x in hw.pupil]
         hw.baseline_mm = mean(vals) if vals else 4.0
+        thread = st.session_state["_sentence_thread"]
+        if thread is not None:
+            thread.join(timeout=5)
+        result_list = st.session_state["_sentence_result"]
+        if result_list and isinstance(result_list[0], list) and len(result_list[0]) == 5:
+            st.session_state["sentences"] = result_list[0]
+        else:
+            st.session_state["sentences"] = FALLBACK_SENTENCES
+        assert len(st.session_state["sentences"]) == 5
         st.session_state.phase = "annotate"
         st.session_state.idx = 0
         st.session_state.t_start = time.time()
@@ -229,7 +294,7 @@ elif st.session_state.phase == "baseline":
 # ── PHASE: annotate ─────────────────────────────────────────────────
 elif st.session_state.phase == "annotate":
     idx = st.session_state.idx
-    sentence = SENTENCES[idx]
+    sentence = st.session_state["sentences"][idx]
     st.markdown(
         f"<div style='background:#1e1e1e;color:#fff;padding:40px;border-radius:12px;"
         f"font-size:1.5rem;text-align:center;margin:20px 0'>{sentence}</div>",
@@ -299,7 +364,7 @@ elif st.session_state.phase == "annotate":
             results[-1]["read_secs"], results[-1]["mean_delta"]
         )
         results[-1]["annotation_confidence"] = conf
-        if idx + 1 < len(SENTENCES):
+        if idx + 1 < len(st.session_state["sentences"]):
             st.session_state.idx = idx + 1
             st.session_state.t_start = time.time()
             st.rerun()
@@ -377,9 +442,19 @@ elif st.session_state.phase == "results":
     st.caption(f"Saved to {outpath}")
 
     if st.button("New Session"):
+        with hw.lock:
+            hw.pupil.clear()
+            hw.gaze.clear()
+            hw.eyelid.clear()
+            hw.blinks.clear()
+            hw._bstate = "OPEN"
+            hw._bopen = None
         st.session_state.phase = "start"
         st.session_state.idx = 0
         st.session_state.results = []
         st.session_state.t_start = 0.0
         st.session_state.t_baseline = 0.0
+        st.session_state.sentences = []
+        st.session_state._sentence_result = []
+        st.session_state._sentence_thread = None
         st.rerun()
