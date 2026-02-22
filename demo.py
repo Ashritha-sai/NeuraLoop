@@ -1,6 +1,7 @@
 import streamlit as st
 import threading, time, json, os
 from pathlib import Path
+import statistics
 from statistics import mean
 
 try:
@@ -64,6 +65,106 @@ def _read(inlet):
 def window(buf, t0, t1):
     with hw.lock:
         return [x for x in buf if t0 <= x[0] <= t1]
+
+# ── IMPLICIT SIGNAL LAYER ──────────────────────────────
+
+def compute_confusion_score(pupil_window, gaze_window, baseline_mm):
+    means = [x[3] for x in pupil_window]
+    if not means:
+        return 0.5, 0.0, 0, 0.5
+    mean_delta = statistics.mean(means) - baseline_mm
+    pupil_component = min(max(mean_delta / 0.6, 0.0), 1.0)
+    xs = [g[1] for g in gaze_window]
+    regression_count = 0
+    if len(xs) > 10:
+        x_range = max(xs) - min(xs) if max(xs) != min(xs) else 1
+        for i in range(2, len(xs)):
+            moved_forward = xs[i-2] < xs[i-1]
+            went_back = xs[i] < xs[i-1] - (0.05 * x_range)
+            if moved_forward and went_back:
+                regression_count += 1
+    regression_component = min(regression_count / 3.0, 1.0)
+    confusion = (0.60 * pupil_component) + (0.40 * regression_component)
+    return round(confusion, 3), round(mean_delta, 3), regression_count, round(pupil_component, 3)
+
+
+def compute_attention_score(blink_window, read_secs, sample_count):
+    if read_secs <= 0 or sample_count == 0:
+        return 0.5
+    blink_rate = (len(blink_window) / read_secs) * 60
+    if blink_rate < 4:
+        score = 0.6
+    elif blink_rate < 8:
+        score = 1.0
+    elif blink_rate < 20:
+        score = 0.75
+    elif blink_rate < 25:
+        score = 0.4
+    else:
+        score = 0.2
+    expected_samples = read_secs * 195
+    coverage = sample_count / max(expected_samples, 1)
+    if coverage < 0.5:
+        score *= 0.7
+    return round(score, 3)
+
+
+def compute_annotation_confidence(annotation, confusion_score, attention_score,
+                                   read_secs, mean_delta):
+    explicit = 1.0 if annotation in ("YES", "NO") else 0.0
+    if annotation == "YES":
+        implicit_consistency = 1.0 - (confusion_score * 0.5)
+    elif annotation == "NO":
+        implicit_consistency = 0.5 + (confusion_score * 0.5)
+    else:
+        implicit_consistency = 0.3
+    if read_secs < 1.5:
+        speed_penalty = 0.15
+    elif read_secs < 2.5:
+        speed_penalty = 0.05
+    else:
+        speed_penalty = 0.0
+    confidence = (
+        0.45 * explicit +
+        0.30 * implicit_consistency +
+        0.25 * attention_score
+    ) - speed_penalty
+    return round(max(min(confidence, 1.0), 0.0), 3)
+
+
+def compute_session_score(results):
+    if not results:
+        return 0.0, {}
+    annotated = [r for r in results if r["annotation"] in ("YES", "NO")]
+    coverage = len(annotated) / len(results)
+    mean_confidence = statistics.mean(
+        r["annotation_confidence"] for r in results
+    ) if results else 0.0
+    attention_consistency = statistics.mean(
+        r["attention_score"] for r in results
+    ) if results else 0.0
+    signal_quality = sum(
+        1 for r in results if r["samples"] > 50
+    ) / len(results)
+    session_score = (
+        0.40 * mean_confidence +
+        0.20 * coverage +
+        0.20 * attention_consistency +
+        0.20 * signal_quality
+    )
+    grade = (
+        "EXCELLENT" if session_score > 0.85 else
+        "GOOD"      if session_score > 0.70 else
+        "ACCEPTABLE" if session_score > 0.55 else
+        "LOW QUALITY"
+    )
+    return round(session_score, 3), {
+        "grade": grade,
+        "coverage": round(coverage, 3),
+        "mean_confidence": round(mean_confidence, 3),
+        "attention_consistency": round(attention_consistency, 3),
+        "signal_quality": round(signal_quality, 3)
+    }
 
 # ── Sentences ────────────────────────────────────────────────────────
 SENTENCES = [
@@ -168,6 +269,7 @@ elif st.session_state.phase == "annotate":
             when = "—"
         xs = [x[1] for x in gw]
         ys = [x[2] for x in gw]
+        confusion, mean_d, reg_count, pupil_comp = compute_confusion_score(pw, gw, hw.baseline_mm)
         st.session_state.results.append({
             "sentence":     sentence[:50] + "...",
             "annotation":   "YES" if yes_clicked else "NO",
@@ -182,7 +284,21 @@ elif st.session_state.phase == "annotate":
             "samples":      len(pw),
             "confused":     mean_d > 0.4,
             "timeseries":   [{"t": round(x[0]-t0, 2), "pupil": round(x[3], 3)} for x in pw],
+            # ── implicit signal scores ──
+            "confusion_score":        confusion,
+            "pupil_component":        pupil_comp,
+            "regression_count":       reg_count,
+            "attention_score":        compute_attention_score(bw, t_end-t0, len(pw)),
+            "annotation_confidence":  0.0,
+            "rewrite_triggered":      confusion > 0.55,
         })
+        results = st.session_state.results
+        att = results[-1]["attention_score"]
+        conf = compute_annotation_confidence(
+            results[-1]["annotation"], confusion, att,
+            results[-1]["read_secs"], results[-1]["mean_delta"]
+        )
+        results[-1]["annotation_confidence"] = conf
         if idx + 1 < len(SENTENCES):
             st.session_state.idx = idx + 1
             st.session_state.t_start = time.time()
@@ -225,9 +341,39 @@ elif st.session_state.phase == "results":
     st.markdown(f"**YES:** {yes_n} / **NO:** {no_n}")
     st.markdown(f"**Hardware:** {'NEON Live' if hw.connected else 'Mock Mode'}")
 
+    # ── Session confidence score ─────────────────────────────────────
+    session_score, breakdown = compute_session_score(results)
+    st.divider()
+    st.metric("Session Confidence Score", f"{session_score:.2f}",
+              delta=breakdown.get("grade", ""))
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Coverage", f"{breakdown.get('coverage', 0):.3f}")
+    sc2.metric("Mean Confidence", f"{breakdown.get('mean_confidence', 0):.3f}")
+    sc3.metric("Attention", f"{breakdown.get('attention_consistency', 0):.3f}")
+    sc4.metric("Signal Quality", f"{breakdown.get('signal_quality', 0):.3f}")
+
+    # ── Attention warnings ───────────────────────────────────────────
+    low_att = [r for r in results if r.get("attention_score", 1) < 0.5]
+    if low_att:
+        st.warning(f"Low attention on {len(low_att)} sentence(s):")
+        for r in low_att:
+            st.markdown(f"- {r['sentence']}")
+
+    # ── Rewrite candidates ───────────────────────────────────────────
+    rewrites = [r for r in results if r.get("rewrite_triggered")]
+    if rewrites:
+        st.info(f"{len(rewrites)} sentence(s) would be rewritten in the live LLM loop:")
+        for r in rewrites:
+            st.markdown(f"- {r['sentence']} (confusion: {r['confusion_score']:.3f})")
+
+    # ── DPO pair quality ─────────────────────────────────────────────
+    high_conf = [r for r in results if r.get("annotation_confidence", 0) > 0.72]
+    st.markdown(f"**{len(high_conf)} high-quality DPO pairs generated this session**")
+
     outpath = Path("data/demo_output.json")
     outpath.parent.mkdir(exist_ok=True)
-    outpath.write_text(json.dumps(results, indent=2))
+    output = {"results": results, "session_score": session_score, "breakdown": breakdown}
+    outpath.write_text(json.dumps(output, indent=2))
     st.caption(f"Saved to {outpath}")
 
     if st.button("New Session"):
