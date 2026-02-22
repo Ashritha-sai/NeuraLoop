@@ -191,6 +191,30 @@ def compute_session_score(results):
         "signal_quality": round(signal_quality, 3)
     }
 
+def _generate_neural_diagnosis(result_dict):
+    parts = []
+    cs = result_dict["confusion_score"]
+    md = result_dict.get("pupil_mean_delta", result_dict["mean_delta"])
+    pd_ = result_dict.get("pupil_peak_delta", result_dict["peak_delta"])
+    pw = result_dict["peak_when"]
+    rc = result_dict["regression_count"]
+    ann = result_dict["annotation"]
+
+    if ann == "YES" and cs < 0.3:
+        return f"Low confusion ({cs}), steady pupil response. Sentence processed fluently."
+    if ann == "YES" and cs >= 0.3:
+        return f"User accepted despite moderate confusion ({cs}). Pupil delta {md:+.3f}mm with {rc} regressions — possible tolerance of complexity."
+    # ann == "NO" cases:
+    if pd_ > 0.5:
+        parts.append(f"High pupil dilation (peak {pd_:+.3f}mm at {pw} of sentence)")
+    if rc >= 3:
+        parts.append(f"{rc} gaze regressions indicating re-reading")
+    if cs > 0.55:
+        parts.append(f"confusion score {cs}")
+    if not parts:
+        parts.append(f"Moderate neural difficulty signals (confusion {cs}, delta {md:+.3f}mm)")
+    return ". ".join(parts) + " — suggests cognitive processing difficulty."
+
 # ── Sentences ────────────────────────────────────────────────────────
 FALLBACK_SENTENCES = [
     "Octopuses have three hearts and blue blood.",
@@ -242,10 +266,80 @@ def _fetch_sentences(result_list):
     except Exception:
         result_list.append(FALLBACK_SENTENCES)
 
+def _rewrite_sentences(sentences_with_data, result_list):
+    """Background thread: ask Groq to rewrite unclear sentences using neural signals."""
+    fallback = [
+        {"diagnosis": "Rewrite generated without neural analysis (API unavailable).",
+         "rewrite": "In simpler terms, " + s["sentence"]}
+        for s in sentences_with_data
+    ]
+    if not HAS_GROQ:
+        result_list.append(fallback)
+        return
+    try:
+        lines = []
+        for i, s in enumerate(sentences_with_data, 1):
+            lines.append(
+                f"Sentence {i}: '{s['sentence']}'\n"
+                f"- Pupil dilation: mean {s['pupil_mean_delta']:+.3f}mm, "
+                f"peak {s['pupil_peak_delta']:+.3f}mm at {s['peak_when']} of sentence\n"
+                f"- Gaze regressions: {s['regression_count']} "
+                f"(eyes jumped backward {s['regression_count']} times)\n"
+                f"- Confusion score: {s['confusion_score']}\n"
+                f"- Reading time: {s['read_secs']}s"
+            )
+        user_msg = "\n\n".join(lines)
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a sentence rewriting assistant for a neural annotation system. "
+                        "You will receive sentences that a human reader flagged as unclear or confusing, "
+                        "along with their eye-tracking neural signals. Your job:\n"
+                        "1. Analyze WHY the sentence was confusing using the neural data provided.\n"
+                        "2. Rewrite each sentence to be clearer while preserving the core meaning.\n"
+                        "3. Return ONLY a JSON array of objects, one per sentence, each with exactly "
+                        "two keys: 'diagnosis' (string: 1-2 sentence explanation of what was likely "
+                        "confusing, referencing the neural signals) and 'rewrite' (string: the improved "
+                        "sentence). No markdown, no code fences, just raw JSON."
+                    ),
+                },
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=600,
+            temperature=0.7,
+        )
+        text = response.choices[0].message.content.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        parsed = json.loads(text)
+        if (isinstance(parsed, list)
+                and len(parsed) == len(sentences_with_data)
+                and all(isinstance(d, dict) and "diagnosis" in d and "rewrite" in d for d in parsed)):
+            result_list.append(parsed)
+        else:
+            result_list.append(fallback)
+    except Exception:
+        result_list.append(fallback)
+
 # ── Streamlit UI ─────────────────────────────────────────────────────
 st.set_page_config(page_title="Implicit Annotator", layout="wide")
 
-for k, v in {"phase": "start", "idx": 0, "results": [], "t_start": 0.0, "t_baseline": 0.0, "sentences": [], "_sentence_result": [], "_sentence_thread": None}.items():
+for k, v in {
+    "phase": "start", "idx": 0, "results": [], "t_start": 0.0, "t_baseline": 0.0,
+    "sentences": [], "_sentence_result": [], "_sentence_thread": None,
+    "rewrite_round": 0, "rewrite_queue": [], "rewrite_sentences": [],
+    "rewrite_results": [], "rewrite_idx": 0, "dpo_log": [],
+    "_rewrite_thread": None, "_rewrite_result": [],
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -422,28 +516,320 @@ elif st.session_state.phase == "results":
     sc3.metric("Attention", f"{breakdown.get('attention_consistency', 0):.3f}")
     sc4.metric("Signal Quality", f"{breakdown.get('signal_quality', 0):.3f}")
 
-    # ── Attention warnings ───────────────────────────────────────────
-    low_att = [r for r in results if r.get("attention_score", 1) < 0.5]
-    if low_att:
-        st.warning(f"Low attention on {len(low_att)} sentence(s):")
-        for r in low_att:
-            st.markdown(f"- {r['sentence']}")
+    # ── Build initial DPO log from first-pass results ────────────────
+    if not st.session_state["dpo_log"]:
+        dpo_log = []
+        for i, r in enumerate(results):
+            full_sentence = st.session_state["sentences"][i]
+            diag = _generate_neural_diagnosis(r)
+            dpo_log.append({
+                "original_sentence": full_sentence,
+                "final_sentence": full_sentence if r["annotation"] == "YES" else None,
+                "total_rewrites": 0,
+                "accepted": r["annotation"] == "YES",
+                "original_index": i,
+                "history": [{
+                    "version": 0,
+                    "sentence": full_sentence,
+                    "annotation": r["annotation"],
+                    "confusion_score": r["confusion_score"],
+                    "attention_score": r["attention_score"],
+                    "annotation_confidence": r["annotation_confidence"],
+                    "pupil_mean_delta": r["mean_delta"],
+                    "pupil_peak_delta": r["peak_delta"],
+                    "peak_when": r["peak_when"],
+                    "regression_count": r["regression_count"],
+                    "read_secs": r["read_secs"],
+                    "samples": r["samples"],
+                    "neural_diagnosis": diag,
+                }],
+            })
+        st.session_state["dpo_log"] = dpo_log
 
-    # ── Rewrite candidates ───────────────────────────────────────────
-    rewrites = [r for r in results if r.get("rewrite_triggered")]
-    if rewrites:
-        st.info(f"{len(rewrites)} sentence(s) would be rewritten in the live LLM loop:")
-        for r in rewrites:
-            st.markdown(f"- {r['sentence']} (confusion: {r['confusion_score']:.3f})")
+    # ── Rewrite loop or finish ───────────────────────────────────────
+    no_indices = [i for i, r in enumerate(results) if r["annotation"] == "NO"]
+    if no_indices:
+        st.info(f"{len(no_indices)} sentence(s) marked NO — eligible for rewrite.")
+        col_rw1, col_rw2 = st.columns(2)
+        if col_rw1.button("Start Rewrite Loop", type="primary", use_container_width=True):
+            queue = []
+            for i in no_indices:
+                r = results[i]
+                queue.append({
+                    "sentence": st.session_state["sentences"][i],
+                    "confusion_score": r["confusion_score"],
+                    "pupil_mean_delta": r["mean_delta"],
+                    "pupil_peak_delta": r["peak_delta"],
+                    "peak_when": r["peak_when"],
+                    "regression_count": r["regression_count"],
+                    "read_secs": r["read_secs"],
+                    "dpo_index": i,
+                })
+            st.session_state["rewrite_queue"] = queue
+            st.session_state["rewrite_round"] = 1
+            st.session_state["_rewrite_thread"] = None
+            st.session_state["_rewrite_result"] = []
+            st.session_state["rewrite_results"] = []
+            st.session_state.phase = "rewriting"
+            st.rerun()
+        if col_rw2.button("Skip Rewrites — Finish Session", use_container_width=True):
+            st.session_state.phase = "final_results"
+            st.rerun()
+    else:
+        st.success("All sentences accepted! No rewrites needed.")
+        st.session_state.phase = "final_results"
+        st.rerun()
 
-    # ── DPO pair quality ─────────────────────────────────────────────
-    high_conf = [r for r in results if r.get("annotation_confidence", 0) > 0.72]
-    st.markdown(f"**{len(high_conf)} high-quality DPO pairs generated this session**")
+# ── PHASE: rewriting ─────────────────────────────────────────────────
+elif st.session_state.phase == "rewriting":
+    queue = st.session_state["rewrite_queue"]
+    rnd = st.session_state["rewrite_round"]
+    if st.session_state["_rewrite_thread"] is None:
+        result_list = []
+        st.session_state["_rewrite_result"] = result_list
+        t = threading.Thread(target=_rewrite_sentences, args=(queue, result_list), daemon=True)
+        st.session_state["_rewrite_thread"] = t
+        t.start()
+    thread = st.session_state["_rewrite_thread"]
+    with st.spinner(f"Rewriting {len(queue)} sentence(s) using neural signals... (round {rnd})"):
+        thread.join(timeout=0.1)
+    if not thread.is_alive():
+        result_list = st.session_state["_rewrite_result"]
+        if result_list:
+            parsed = result_list[0]
+        else:
+            parsed = [
+                {"diagnosis": "Rewrite generated without neural analysis (API unavailable).",
+                 "rewrite": "In simpler terms, " + s["sentence"]}
+                for s in queue
+            ]
+        rw_sentences = []
+        for i, s in enumerate(queue):
+            rw_sentences.append({
+                "original": s["sentence"],
+                "rewrite": parsed[i]["rewrite"],
+                "diagnosis": parsed[i]["diagnosis"],
+                "dpo_index": s["dpo_index"],
+            })
+        st.session_state["rewrite_sentences"] = rw_sentences
+        st.session_state["rewrite_idx"] = 0
+        st.session_state["rewrite_results"] = []
+        st.session_state.t_start = time.time()
+        st.session_state.phase = "rewrite_annotate"
+        st.rerun()
+    else:
+        time.sleep(0.3)
+        st.rerun()
 
-    outpath = Path("data/demo_output.json")
+# ── PHASE: rewrite_annotate ──────────────────────────────────────────
+elif st.session_state.phase == "rewrite_annotate":
+    rw_idx = st.session_state["rewrite_idx"]
+    rw_sentences = st.session_state["rewrite_sentences"]
+    rnd = st.session_state["rewrite_round"]
+    rw = rw_sentences[rw_idx]
+
+    st.subheader(f"Rewrite Round {rnd} — Sentence {rw_idx + 1} of {len(rw_sentences)}")
+    st.markdown(
+        f"<div style='background:#333;color:#aaa;padding:15px;border-radius:8px;"
+        f"font-size:1rem;margin:10px 0'><b>Original:</b> {rw['original']}</div>",
+        unsafe_allow_html=True,
+    )
+    st.info(f"**LLM Diagnosis:** {rw['diagnosis']}")
+    st.markdown(
+        f"<div style='background:#1e1e1e;color:#fff;padding:40px;border-radius:12px;"
+        f"font-size:1.5rem;text-align:center;margin:20px 0'>{rw['rewrite']}</div>",
+        unsafe_allow_html=True,
+    )
+    live_pupil_metrics()
+
+    col1, col2 = st.columns(2)
+    yes_clicked = col1.button("YES", type="primary", use_container_width=True, key=f"rw_yes_{rnd}_{rw_idx}")
+    no_clicked = col2.button("NO", type="secondary", use_container_width=True, key=f"rw_no_{rnd}_{rw_idx}")
+
+    if yes_clicked or no_clicked:
+        t_end = time.time()
+        t0 = st.session_state.t_start
+        pw = window(hw.pupil, t0, t_end)
+        gw = window(hw.gaze, t0, t_end)
+        ew = window(hw.eyelid, t0, t_end)
+        bw = [b for b in hw.blinks if t0 <= b[0] <= t_end]
+        means = [x[3] for x in pw]
+        mean_d = mean(means) - hw.baseline_mm if means else 0.0
+        peak_d = max(means) - hw.baseline_mm if means else 0.0
+        if means:
+            pi = means.index(max(means))
+            frac = pi / len(means)
+            when = "early" if frac < 0.33 else "middle" if frac < 0.66 else "late"
+        else:
+            when = "—"
+        xs = [x[1] for x in gw]
+        ys = [x[2] for x in gw]
+        confusion, mean_d, reg_count, pupil_comp = compute_confusion_score(pw, gw, hw.baseline_mm)
+        att = compute_attention_score(bw, t_end - t0, len(pw))
+        ann_label = "YES" if yes_clicked else "NO"
+        conf = compute_annotation_confidence(ann_label, confusion, att, t_end - t0, mean_d)
+        result_dict = {
+            "sentence":     rw["rewrite"][:50] + "...",
+            "annotation":   ann_label,
+            "mean_delta":   round(mean_d, 3),
+            "peak_delta":   round(peak_d, 3),
+            "peak_when":    when,
+            "eyelid_mm":    round(mean([(x[1]+x[2])/2 for x in ew]), 2) if ew else 0,
+            "blinks":       len(bw),
+            "gaze_x_range": round(max(xs) - min(xs), 0) if xs else 0,
+            "gaze_y_range": round(max(ys) - min(ys), 0) if ys else 0,
+            "read_secs":    round(t_end - t0, 1),
+            "samples":      len(pw),
+            "confused":     mean_d > 0.4,
+            "timeseries":   [{"t": round(x[0]-t0, 2), "pupil": round(x[3], 3)} for x in pw],
+            "confusion_score":        confusion,
+            "pupil_component":        pupil_comp,
+            "regression_count":       reg_count,
+            "attention_score":        att,
+            "annotation_confidence":  conf,
+            "rewrite_triggered":      confusion > 0.55,
+            "rewrite_round":          rnd,
+            "llm_diagnosis":          rw["diagnosis"],
+        }
+        st.session_state["rewrite_results"].append({
+            "result": result_dict,
+            "dpo_index": rw["dpo_index"],
+            "full_sentence": rw["rewrite"],
+        })
+        if rw_idx + 1 < len(rw_sentences):
+            st.session_state["rewrite_idx"] = rw_idx + 1
+            st.session_state.t_start = time.time()
+            st.rerun()
+        else:
+            st.session_state.phase = "rewrite_check"
+            st.rerun()
+    else:
+        pass  # fragment auto-refreshes live metrics
+
+# ── PHASE: rewrite_check ─────────────────────────────────────────────
+elif st.session_state.phase == "rewrite_check":
+    rnd = st.session_state["rewrite_round"]
+    rewrite_results = st.session_state["rewrite_results"]
+    dpo_log = st.session_state["dpo_log"]
+    still_no = []
+
+    for rr in rewrite_results:
+        dpo_idx = rr["dpo_index"]
+        r = rr["result"]
+        entry = dpo_log[dpo_idx]
+        diag = _generate_neural_diagnosis(r)
+        entry["history"].append({
+            "version": rnd,
+            "sentence": rr["full_sentence"],
+            "annotation": r["annotation"],
+            "confusion_score": r["confusion_score"],
+            "attention_score": r["attention_score"],
+            "annotation_confidence": r["annotation_confidence"],
+            "pupil_mean_delta": r["mean_delta"],
+            "pupil_peak_delta": r["peak_delta"],
+            "peak_when": r["peak_when"],
+            "regression_count": r["regression_count"],
+            "read_secs": r["read_secs"],
+            "samples": r["samples"],
+            "neural_diagnosis": diag,
+        })
+        if r["annotation"] == "YES":
+            entry["accepted"] = True
+            entry["final_sentence"] = rr["full_sentence"]
+            entry["total_rewrites"] = rnd
+        else:
+            still_no.append({
+                "sentence": rr["full_sentence"],
+                "confusion_score": r["confusion_score"],
+                "pupil_mean_delta": r["mean_delta"],
+                "pupil_peak_delta": r["peak_delta"],
+                "peak_when": r["peak_when"],
+                "regression_count": r["regression_count"],
+                "read_secs": r["read_secs"],
+                "dpo_index": dpo_idx,
+            })
+
+    if still_no and rnd < 3:
+        st.session_state["rewrite_queue"] = still_no
+        st.session_state["rewrite_round"] = rnd + 1
+        st.session_state["_rewrite_thread"] = None
+        st.session_state["_rewrite_result"] = []
+        st.session_state["rewrite_results"] = []
+        st.session_state.phase = "rewriting"
+        st.rerun()
+    else:
+        for entry in dpo_log:
+            if not entry["accepted"]:
+                entry["total_rewrites"] = rnd
+        st.session_state.phase = "final_results"
+        st.rerun()
+
+# ── PHASE: final_results ─────────────────────────────────────────────
+elif st.session_state.phase == "final_results":
+    st.title("Session Complete — DPO Training Log")
+    dpo_log = st.session_state["dpo_log"]
+    all_results = st.session_state.results
+
+    for i, entry in enumerate(dpo_log):
+        status_icon = "YES" if entry["accepted"] else "NO"
+        with st.expander(f"{status_icon} Sentence {i+1}: {entry['original_sentence'][:60]}..."):
+            st.markdown(f"**Total rewrites:** {entry['total_rewrites']}")
+            if entry["accepted"] and entry.get("final_sentence"):
+                st.success(f"**Final accepted:** {entry['final_sentence']}")
+            else:
+                st.error("**Not accepted** after all rewrite rounds.")
+            for h in entry["history"]:
+                label = "Original" if h["version"] == 0 else f"Rewrite round {h['version']}"
+                st.markdown(f"---\n**{label}:** {h['sentence']}")
+                st.markdown(
+                    f"Annotation: **{h['annotation']}** | "
+                    f"Confusion: {h['confusion_score']} | "
+                    f"Attention: {h['attention_score']} | "
+                    f"Confidence: {h['annotation_confidence']}"
+                )
+                st.caption(f"Neural diagnosis: {h['neural_diagnosis']}")
+
+    # ── Summary metrics ──────────────────────────────────────────────
+    st.divider()
+    total = len(dpo_log)
+    accepted_first = sum(1 for e in dpo_log if e["accepted"] and e["total_rewrites"] == 0)
+    required_rewrites = sum(1 for e in dpo_log if e["total_rewrites"] > 0)
+    max_rounds = max((e["total_rewrites"] for e in dpo_log), default=0)
+    rewrites_to_accept = [e["total_rewrites"] for e in dpo_log if e["accepted"] and e["total_rewrites"] > 0]
+    avg_rewrites = mean(rewrites_to_accept) if rewrites_to_accept else 0.0
+    unresolved = sum(1 for e in dpo_log if not e["accepted"])
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("Total Sentences", total)
+    mc2.metric("Accepted First Pass", accepted_first)
+    mc3.metric("Required Rewrites", required_rewrites)
+    mc4, mc5, mc6 = st.columns(3)
+    mc4.metric("Max Rounds Used", max_rounds)
+    mc5.metric("Avg Rewrites to Accept", f"{avg_rewrites:.1f}")
+    mc6.metric("Unresolved", unresolved)
+
+    # ── Session score on all results ─────────────────────────────────
+    session_score, breakdown = compute_session_score(all_results)
+    st.divider()
+    st.metric("Session Confidence Score", f"{session_score:.2f}",
+              delta=breakdown.get("grade", ""))
+
+    # ── Save DPO log ─────────────────────────────────────────────────
+    outpath = Path("data/dpo_log.json")
     outpath.parent.mkdir(exist_ok=True)
-    output = {"results": results, "session_score": session_score, "breakdown": breakdown}
-    outpath.write_text(json.dumps(output, indent=2))
+    dpo_output = {
+        "dpo_log": dpo_log,
+        "session_score": session_score,
+        "breakdown": breakdown,
+        "rewrite_stats": {
+            "total_sentences": total,
+            "accepted_first_pass": accepted_first,
+            "required_rewrites": required_rewrites,
+            "max_rounds_used": max_rounds,
+            "still_unresolved": unresolved,
+        },
+    }
+    outpath.write_text(json.dumps(dpo_output, indent=2))
     st.caption(f"Saved to {outpath}")
 
     if st.button("New Session"):
@@ -462,4 +848,12 @@ elif st.session_state.phase == "results":
         st.session_state["sentences"] = []
         st.session_state["_sentence_result"] = []
         st.session_state["_sentence_thread"] = None
+        st.session_state["rewrite_round"] = 0
+        st.session_state["rewrite_queue"] = []
+        st.session_state["rewrite_sentences"] = []
+        st.session_state["rewrite_results"] = []
+        st.session_state["rewrite_idx"] = 0
+        st.session_state["dpo_log"] = []
+        st.session_state["_rewrite_thread"] = None
+        st.session_state["_rewrite_result"] = []
         st.rerun()
